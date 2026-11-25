@@ -410,6 +410,135 @@ def recommend_plan(profile):
     return items
 
 
+
+def generate_ai_workout_plan(profile, preferences,
+                             base_url=OLLAMA_URL_DEFAULT,
+                             model=OLLAMA_MODEL_DEFAULT):
+    """Generate and validate a personalized workout plan with local Ollama."""
+    allowed_exercises = list(EXERCISES.keys())
+
+    prompt = f"""
+You are K-Fitness, a cautious fitness-planning assistant.
+
+Use ONLY these supported exercises:
+{json.dumps(allowed_exercises)}
+
+USER PROFILE:
+- Age: {profile.get("age")}
+- Gender: {profile.get("gender") or "Not specified"}
+- Height: {profile.get("height_cm")} cm
+- Weight: {profile.get("weight_kg")} kg
+- Goal: {profile.get("goal")}
+- Experience: {profile.get("experience")}
+
+USER PREFERENCES:
+- Activity level: {preferences.get("activity_level")}
+- Workout days per week: {preferences.get("days_per_week")}
+- Session duration: {preferences.get("session_minutes")} minutes
+- Equipment: {preferences.get("equipment")}
+- Physical limitations/restrictions: {preferences.get("limitations")}
+
+RULES:
+- Return 2 to 5 exercise entries.
+- Each exercise must be from the supported list.
+- Sets: integer 1 to 4; reps: integer 4 to 15; rest: integer 30 to 180 seconds.
+- Keep the plan conservative and appropriate to the stated experience.
+- Do not infer ability from gender, age, height or weight alone.
+- Do not diagnose, prescribe treatment or claim to prevent injuries.
+- If a user mentions pain, injury, a medical condition or rehabilitation restriction,
+  clearly say a qualified healthcare professional should approve the plan.
+- Return JSON only, with no Markdown or extra text.
+
+Required JSON:
+{{
+  "title": "Personalized plan title",
+  "rationale": "Brief explanation of the plan",
+  "weekly_frequency": "Suggested weekly frequency",
+  "items": [
+    {{"exercise": "Squats", "sets": 2, "reps": 8, "rest": 60}}
+  ],
+  "safety_notes": "Safety reminder"
+}}
+"""
+
+    payload = json.dumps({
+        "model": model,
+        "stream": False,
+        "format": "json",
+        "messages": [{"role": "user", "content": prompt}],
+        "options": {"temperature": 0.2}
+    }).encode("utf-8")
+
+    request = urllib.request.Request(
+        base_url.rstrip("/") + "/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    try:
+        with OLLAMA_INFERENCE_LOCK:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                result = json.loads(response.read().decode("utf-8"))
+
+        content = result.get("message", {}).get("content", "").strip()
+        if not content:
+            raise ValueError("The AI returned an empty response.")
+
+        if content.startswith("```"):
+            content = content.replace("```json", "", 1)
+            content = content.replace("```", "").strip()
+
+        data = json.loads(content)
+        items = data.get("items")
+
+        if not isinstance(items, list) or not 2 <= len(items) <= 5:
+            raise ValueError("AI must return between 2 and 5 exercises.")
+
+        validated_items = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("An exercise entry was not valid JSON.")
+
+            exercise = item.get("exercise")
+            if exercise not in allowed_exercises:
+                raise ValueError(f"Unsupported exercise returned: {exercise}")
+
+            sets = int(item.get("sets"))
+            reps = int(item.get("reps"))
+            rest = int(item.get("rest"))
+
+            if not 1 <= sets <= 4:
+                raise ValueError("AI returned sets outside the allowed range.")
+            if not 4 <= reps <= 15:
+                raise ValueError("AI returned repetitions outside the allowed range.")
+            if not 30 <= rest <= 180:
+                raise ValueError("AI returned rest outside the allowed range.")
+
+            validated_items.append({
+                "exercise": exercise,
+                "sets": sets,
+                "reps": reps,
+                "rest": rest
+            })
+
+        data["items"] = validated_items
+        data["title"] = str(data.get("title") or f"{profile.get('goal')} plan")[:80]
+        data["rationale"] = str(data.get("rationale") or "")
+        data["weekly_frequency"] = str(data.get("weekly_frequency") or "")
+        data["safety_notes"] = str(data.get("safety_notes") or "")
+        return data
+
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            "Could not connect to Ollama. Start Ollama and check that "
+            f"the model '{model}' is installed. Details: {exc}"
+        ) from exc
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"AI returned an invalid workout plan: {exc}") from exc
+
+
+
 def ollama_vision_feedback(frame_bgr, exercise, angle, reps, feedback,
                            base_url=OLLAMA_URL_DEFAULT, model=OLLAMA_MODEL_DEFAULT):
     """Optional local VLM call. The frame is sent only to the configured local Ollama server."""
@@ -965,8 +1094,7 @@ init_db()
 # Three user-selectable visual systems. The choice is session-persistent and does
 # not alter workout data, model settings, or application behaviour.
 THEMES = {
-    # Inspired by the user's three reference palettes. Strong colours are used
-    # for surfaces and accents; long-form text remains neutral for readability.
+    # Plum Dusk is intentionally retained exactly as the original palette.
     "Plum Dusk": {
         "bg": "#190019", "surface": "#2B124C", "surface2": "#522B5B",
         "sidebar": "#190019", "ink": "#FBE4D8", "muted": "#DFB6B2",
@@ -979,38 +1107,38 @@ THEMES = {
         "alert_bg": "#3A2050", "alert_border": "#68466D", "alert_ink": "#FBE4D8",
         "page_glow": "rgba(133,79,108,.16)", "primary_text": "#FFFFFF",
     },
-    "Forest Mint": {
-        "bg": "#F3F8F3", "surface": "#FFFFFF", "surface2": "#DAF1DE",
-        "sidebar": "#051F20", "ink": "#18352F", "muted": "#657B70",
-        "primary": "#235347", "primary_hover": "#163832", "accent": "#8EB69B",
-        "line": "#D5E5D9", "hero1": "#F8FCF8", "hero2": "#DAF1DE",
-        "soft": "#EAF4EC", "shadow": "rgba(5,31,32,.08)",
-        "sidebar_ink": "#DAF1DE", "sidebar_muted": "#8EB69B",
-        "chip": "#DAF1DE", "chip_ink": "#163832",
-        "sidebar_control": "#0B2B26", "sidebar_control_ink": "#DAF1DE",
-        "alert_bg": "#E8F3E9", "alert_border": "#B8D1BE", "alert_ink": "#163832",
-        "page_glow": "rgba(142,182,155,.18)", "primary_text": "#FFFFFF",
+    "Dark Green": {
+        "bg": "#071B17", "surface": "#102B24", "surface2": "#183D32",
+        "sidebar": "#04130F", "ink": "#E8F5EC", "muted": "#A9C4B2",
+        "primary": "#62B58A", "primary_hover": "#438F6A", "accent": "#8BD6AA",
+        "line": "#285442", "hero1": "#102B24", "hero2": "#1D4938",
+        "soft": "#17382D", "shadow": "rgba(0,0,0,.24)",
+        "sidebar_ink": "#E8F5EC", "sidebar_muted": "#A9C4B2",
+        "chip": "#214B39", "chip_ink": "#E8F5EC",
+        "sidebar_control": "#102B24", "sidebar_control_ink": "#E8F5EC",
+        "alert_bg": "#17382D", "alert_border": "#36684F", "alert_ink": "#E8F5EC",
+        "page_glow": "rgba(98,181,138,.15)", "primary_text": "#071B17",
     },
-    "Aqua Pulse": {
-        "bg": "#F1FAF8", "surface": "#FFFFFF", "surface2": "#DDF8EF",
-        "sidebar": "#213A58", "ink": "#183442", "muted": "#627D83",
-        "primary": "#0C6478", "primary_hover": "#095568", "accent": "#46DFB1",
-        "line": "#D3EAE5", "hero1": "#F4FFF8", "hero2": "#B0EE98",
-        "soft": "#E6F8F2", "shadow": "rgba(12,100,120,.09)",
-        "sidebar_ink": "#F2FFF9", "sidebar_muted": "#B0EECE",
-        "chip": "#DDF8EF", "chip_ink": "#0C6478",
-        "sidebar_control": "#294967", "sidebar_control_ink": "#F2FFF9",
-        "alert_bg": "#E3F7F2", "alert_border": "#B5E8D9", "alert_ink": "#164B52",
-        "page_glow": "rgba(9,209,199,.12)", "primary_text": "#FFFFFF",
+    "Minty Sage": {
+        "bg": "#F1F7F2", "surface": "#FFFFFF", "surface2": "#E0EEE3",
+        "sidebar": "#E6F0E8", "ink": "#203B30", "muted": "#60776A",
+        "primary": "#477B60", "primary_hover": "#35634B", "accent": "#A5C9AE",
+        "line": "#D2E2D6", "hero1": "#FFFFFF", "hero2": "#E0EEE3",
+        "soft": "#EAF3EC", "shadow": "rgba(32,59,48,.08)",
+        "sidebar_ink": "#203B30", "sidebar_muted": "#60776A",
+        "chip": "#DCEBE0", "chip_ink": "#294B38",
+        "sidebar_control": "#FFFFFF", "sidebar_control_ink": "#203B30",
+        "alert_bg": "#E8F2EA", "alert_border": "#C7DDCD", "alert_ink": "#294B38",
+        "page_glow": "rgba(165,201,174,.22)", "primary_text": "#FFFFFF",
     },
 }
-if "kf_theme" not in st.session_state:
-    st.session_state.kf_theme = "Forest Mint"
+if st.session_state.get("kf_theme") not in THEMES:
+    st.session_state.kf_theme = "Dark Green"
 with st.sidebar:
     st.markdown("<div class='kf-brand-mini'>KF <span>STUDIO</span></div>", unsafe_allow_html=True)
     selected_theme = st.selectbox(
         "Appearance", list(THEMES.keys()), key="kf_theme",
-        help="Choose Plum Dusk, Forest Mint or Aqua Pulse. Your workout data is unchanged."
+        help="Choose Plum Dusk, Dark Green or Minty Sage. Your workout data is unchanged."
     )
     palette = THEMES[selected_theme]
     swatches = "".join(
@@ -1185,100 +1313,6 @@ small, .stCaption {{ color:var(--kf-muted); }}
 [data-testid="stSidebar"] [data-testid="stRadio"] label {{ color:var(--kf-sidebar-ink)!important; }}
 [data-testid="stSidebar"] [data-testid="stSelectbox"] div[data-baseweb="select"] > div {{ background:var(--kf-surface); }}
 
-/* FINAL VISIBILITY PATCH: sidebar navigation and dark select controls.
-   Keep every existing palette, background, border, spacing and layout intact. */
-[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] *,
-[data-testid="stSidebar"] [data-testid="stRadio"] *,
-[data-testid="stSidebar"] [data-testid="stWidgetLabel"] *,
-[data-testid="stSidebar"] label,
-[data-testid="stSidebar"] small,
-[data-testid="stSidebar"] .stCaption {
-  color:#FFFFFF!important;
-  -webkit-text-fill-color:#FFFFFF!important;
-}
-/* Selected values inside charcoal/dark dropdown controls must be light. */
-[data-testid="stSelectbox"] [data-baseweb="select"] > div,
-[data-testid="stSelectbox"] [data-baseweb="select"] > div *,
-[data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] > div,
-[data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] > div *,
-[data-testid="stMultiSelect"] [data-baseweb="select"] > div,
-[data-testid="stMultiSelect"] [data-baseweb="select"] > div * {
-  color:#FFFFFF!important;
-  -webkit-text-fill-color:#FFFFFF!important;
-}
-/* Keep the opened option list readable on its existing light popover. */
-[data-baseweb="popover"] [role="option"],
-[data-baseweb="popover"] [role="option"] * {
-  color:#183442!important;
-  -webkit-text-fill-color:#183442!important;
-}
-@media (max-width: 800px) {{ .block-container {{ padding-left:1rem; padding-right:1rem; }} .kf-hero {{ padding:1.25rem; }} .kf-hero h1 {{ font-size:1.75rem; }} }}
-/* FINAL TEXT-ONLY CONTRAST PATCH.
-   Do not change any backgrounds, borders, palette values, spacing or layout.
-   The actual rendered BaseWeb controls use nested spans/divs, so target every
-   text-bearing descendant with high specificity. */
-[data-testid="stSelectbox"] [data-baseweb="select"],
-[data-testid="stSelectbox"] [data-baseweb="select"] *,
-[data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"],
-[data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] *,
-[data-testid="stMultiSelect"] [data-baseweb="select"],
-[data-testid="stMultiSelect"] [data-baseweb="select"] * {
- color:#FFFFFF!important;
- -webkit-text-fill-color:#FFFFFF!important;
-}
-/* Streamlit info/success/warning banners: their dark surfaces need light text. */
-[data-testid="stAlert"],
-[data-testid="stAlert"] *,
-[data-testid="stAlertContent"],
-[data-testid="stAlertContent"] *,
-.stAlert, .stAlert * {
- color:#FFFFFF!important;
- -webkit-text-fill-color:#FFFFFF!important;
-}
-/* Dropdown menu is a separate light popover: retain dark readable option text. */
-[data-baseweb="popover"],
-[data-baseweb="popover"] [role="listbox"],
-[data-baseweb="popover"] [role="option"],
-[data-baseweb="popover"] [role="option"] * {
- color:#24352E!important;
- -webkit-text-fill-color:#24352E!important;
-}
-/* FINAL OVERRIDE: readable selected values in every dark BaseWeb select.
-   The opened menu remains light with dark option text. */
-[data-testid="stSelectbox"] [data-baseweb="select"] > div,
-[data-testid="stSelectbox"] [data-baseweb="select"] > div *,
-[data-testid="stMultiSelect"] [data-baseweb="select"] > div,
-[data-testid="stMultiSelect"] [data-baseweb="select"] > div *,
-[data-testid="stSidebar"] [data-baseweb="select"] > div,
-[data-testid="stSidebar"] [data-baseweb="select"] > div * {
-  color:#FFFFFF !important;
-  -webkit-text-fill-color:#FFFFFF !important;
-  opacity:1 !important;
-}
-[data-baseweb="popover"],
-[data-baseweb="popover"] *,
-[data-baseweb="popover"] [role="option"],
-[data-baseweb="popover"] [role="option"] * {
-  color:#183442 !important;
-  -webkit-text-fill-color:#183442 !important;
-}
-/* Primary action buttons have dark theme fills: force their labels/icons light. */
-.stButton > button[kind="primary"],
-.stButton > button[kind="primary"] *,
-.stFormSubmitButton > button[kind="primary"],
-.stFormSubmitButton > button[kind="primary"] * {
-  color:#FFFFFF !important;
-  -webkit-text-fill-color:#FFFFFF !important;
-}
-/* Sidebar navigation, account labels and helper copy stay bright on dark rails. */
-[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] *,
-[data-testid="stSidebar"] [data-testid="stRadio"] label,
-[data-testid="stSidebar"] [data-testid="stWidgetLabel"] *,
-[data-testid="stSidebar"] .stCaption,
-[data-testid="stSidebar"] small {
-  color:#FFFFFF !important;
-  -webkit-text-fill-color:#FFFFFF !important;
-}
 /* Modern dashboard layout inspired by the supplied fitness UI reference */
 .kf-dashboard-heading {{ display:flex; align-items:flex-end; justify-content:space-between; gap:1rem; margin:.35rem 0 1.35rem; }}
 .kf-dashboard-heading h1 {{ color:var(--kf-ink); font-size:2.15rem; letter-spacing:-.055em; margin:.25rem 0 .15rem; font-weight:800; }}
@@ -1300,6 +1334,79 @@ small, .stCaption {{ color:var(--kf-muted); }}
 [data-testid="stRadio"] label {{ border-radius:9px; padding:.22rem .38rem; }}
 [data-testid="stRadio"] label:hover {{ background:var(--kf-sidebar-control); }}
 
+/* Theme-aware select controls: selected value, input text and opened menu.
+   BaseWeb popovers may be mounted outside the Streamlit app container, so the
+   theme variables are declared on :root and remain available to the menu. */
+[data-testid="stSelectbox"] [data-baseweb="select"] > div,
+[data-testid="stMultiSelect"] [data-baseweb="select"] > div {
+  background-color:var(--kf-surface)!important;
+  border-color:var(--kf-line)!important;
+}
+[data-testid="stSelectbox"] [data-baseweb="select"] > div *,
+[data-testid="stMultiSelect"] [data-baseweb="select"] > div *,
+[data-testid="stSelectbox"] [role="combobox"],
+[data-testid="stMultiSelect"] [role="combobox"],
+[data-testid="stSelectbox"] input,
+[data-testid="stMultiSelect"] input {
+  color:var(--kf-ink)!important;
+  -webkit-text-fill-color:var(--kf-ink)!important;
+  opacity:1!important;
+}
+[data-testid="stSelectbox"] svg,
+[data-testid="stMultiSelect"] svg {
+  fill:var(--kf-muted)!important;
+  color:var(--kf-muted)!important;
+}
+/* Sidebar controls use their own theme-specific foreground/background pair. */
+[data-testid="stSidebar"] [data-baseweb="select"] > div,
+[data-testid="stSidebar"] [data-testid="stTextInput"] input {
+  background-color:var(--kf-sidebar-control)!important;
+  border-color:var(--kf-line)!important;
+  color:var(--kf-sidebar-control-ink)!important;
+}
+[data-testid="stSidebar"] [data-baseweb="select"] > div *,
+[data-testid="stSidebar"] [data-baseweb="select"] input,
+[data-testid="stSidebar"] [data-baseweb="select"] [role="combobox"] {
+  color:var(--kf-sidebar-control-ink)!important;
+  -webkit-text-fill-color:var(--kf-sidebar-control-ink)!important;
+  opacity:1!important;
+}
+/* Dropdown menu and options follow the active palette in all three themes. */
+[data-baseweb="popover"],
+[data-baseweb="popover"] [role="listbox"] {
+  background:var(--kf-surface)!important;
+  border:1px solid var(--kf-line)!important;
+}
+[data-baseweb="popover"] [role="option"],
+[data-baseweb="popover"] [role="option"] *,
+[data-baseweb="popover"] [role="listbox"] * {
+  color:var(--kf-ink)!important;
+  -webkit-text-fill-color:var(--kf-ink)!important;
+  opacity:1!important;
+}
+[data-baseweb="popover"] [role="option"]:hover {
+  background:var(--kf-soft)!important;
+}
+[data-baseweb="popover"] [aria-selected="true"] {
+  background:var(--kf-soft)!important;
+  color:var(--kf-ink)!important;
+}
+/* Alerts and sidebar copy also use theme variables, not fixed white text. */
+[data-testid="stAlert"],
+[data-testid="stAlert"] [data-testid="stMarkdownContainer"] *,
+[data-testid="stAlert"] [data-testid="stAlertContent"] * {
+  color:var(--kf-alert-ink)!important;
+  -webkit-text-fill-color:var(--kf-alert-ink)!important;
+}
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] *,
+[data-testid="stSidebar"] [data-testid="stRadio"] label,
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] *,
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] .stCaption,
+[data-testid="stSidebar"] small {
+  color:var(--kf-sidebar-ink)!important;
+  -webkit-text-fill-color:var(--kf-sidebar-ink)!important;
+}
 </style>
 """
 replacements = {
@@ -1494,72 +1601,197 @@ elif page == "Home":
         st.markdown('<div class="kf-bottom-note">K-Fitness combines pose tracking with visual AI coaching. Feedback is informational and not a medical assessment.</div>', unsafe_allow_html=True)
 
 elif page == "Workout Plan":
-    st.subheader("Your personalized workout plan")
+    st.subheader("AI-Powered Personalized Workout Plan")
+
     if not active:
         st.warning("Create a profile first.")
     else:
         st.write(
-            f"Plan suggestions are based on your goal (**{active['goal']}**) "
-            f"and experience (**{active['experience']}**). They are editable starting suggestions, "
-            "not medical prescriptions."
+            f"Creating a plan for **{active['name']}** using your saved profile: "
+            f"age {active['age']}, {active['weight_kg']} kg, "
+            f"{active['height_cm']} cm, goal: {active['goal']}."
         )
+        st.info(
+            "AI suggestions are starting points. Review and edit the plan before saving. "
+            "They are not medical prescriptions."
+        )
+
         current_plan, current_items = get_active_plan(active["user_code"])
-        if st.button("Generate recommended plan", type="primary"):
+
+        st.markdown("### Customize your workout requirements")
+        with st.form("ai_plan_preferences_form"):
+            p1, p2 = st.columns(2)
+            activity_level = p1.selectbox(
+                "Current activity level",
+                ["Sedentary", "Lightly active", "Moderately active", "Very active"]
+            )
+            days_per_week = p2.selectbox(
+                "Workout days per week", [2, 3, 4, 5, 6], index=1
+            )
+
+            p3, p4 = st.columns(2)
+            session_minutes = p3.selectbox(
+                "Preferred session duration", [15, 20, 30, 45, 60], index=2
+            )
+            equipment = p4.selectbox(
+                "Available equipment",
+                [
+                    "No equipment", "Chair only", "Dumbbells",
+                    "Resistance bands", "Dumbbells and resistance bands"
+                ]
+            )
+
+            limitations = st.text_area(
+                "Injuries, pain or physical restrictions (optional)",
+                placeholder="Mention restrictions you want the plan to consider.",
+                help="Avoid entering private medical information you do not want processed."
+            )
+
+            generate_ai = st.form_submit_button(
+                "Generate AI Workout Plan",
+                type="primary",
+                use_container_width=True
+            )
+
+        if generate_ai:
+            preferences = {
+                "activity_level": activity_level,
+                "days_per_week": days_per_week,
+                "session_minutes": session_minutes,
+                "equipment": equipment,
+                "limitations": limitations.strip() or "None provided"
+            }
+
+            try:
+                with st.spinner("Qwen is generating your personalized workout plan..."):
+                    ai_plan = generate_ai_workout_plan(active, preferences)
+
+                st.session_state["draft_plan_items"] = ai_plan["items"]
+                st.session_state["draft_plan_title"] = ai_plan["title"]
+                st.session_state["ai_plan_rationale"] = ai_plan["rationale"]
+                st.session_state["ai_plan_frequency"] = ai_plan["weekly_frequency"]
+                st.session_state["ai_plan_safety"] = ai_plan["safety_notes"]
+                st.session_state["ai_plan_preferences_data"] = preferences
+                st.success("Your AI-generated plan is ready. Review it below.")
+
+            except Exception as exc:
+                st.error(str(exc))
+                st.caption(
+                    "You can use the existing rule-based recommendation if AI is unavailable."
+                )
+
+        if st.button("Use basic recommended plan instead"):
             st.session_state["draft_plan_items"] = recommend_plan(active)
             st.session_state["draft_plan_title"] = f"{active['goal']} plan"
-            st.rerun()
+            for key in (
+                "ai_plan_rationale", "ai_plan_frequency",
+                "ai_plan_safety", "ai_plan_preferences_data"
+            ):
+                st.session_state.pop(key, None)
 
         if "draft_plan_items" not in st.session_state:
             st.session_state["draft_plan_items"] = (
-                [{"exercise": x["exercise"], "sets": x["sets"],
-                  "reps": x["reps_per_set"], "rest": x["rest_seconds"]}
-                 for x in current_items] if current_items
-                else recommend_plan(active)
+                [
+                    {
+                        "exercise": x["exercise"],
+                        "sets": x["sets"],
+                        "reps": x["reps_per_set"],
+                        "rest": x["rest_seconds"]
+                    }
+                    for x in current_items
+                ]
+                if current_items else recommend_plan(active)
             )
+
         draft = st.session_state["draft_plan_items"]
+
+        if st.session_state.get("ai_plan_rationale"):
+            st.markdown("### Why this plan?")
+            st.write(st.session_state["ai_plan_rationale"])
+
+        if st.session_state.get("ai_plan_frequency"):
+            st.caption(
+                "Suggested frequency: " + st.session_state["ai_plan_frequency"]
+            )
+
+        if st.session_state.get("ai_plan_safety"):
+            st.warning(st.session_state["ai_plan_safety"])
+
         title = st.text_input(
             "Plan name",
-            value=st.session_state.get("draft_plan_title", f"{active['goal']} plan"),
+            value=st.session_state.get(
+                "draft_plan_title", f"{active['goal']} plan"
+            ),
             key="plan_title_input"
         )
-        st.markdown("#### Edit exercises, sets, repetitions and rest")
+
+        st.markdown("#### Review and edit exercises, sets, repetitions and rest")
         edited = []
+
         for idx, item in enumerate(draft):
             with st.container(border=True):
-                st.markdown(f"**Exercise {idx+1}**")
+                st.markdown(f"**Exercise {idx + 1}**")
                 ex = st.selectbox(
-                    "Exercise", list(EXERCISES.keys()),
+                    "Exercise",
+                    list(EXERCISES.keys()),
                     index=list(EXERCISES.keys()).index(item["exercise"]),
                     key=f"plan_ex_{idx}"
                 )
                 a, b, c = st.columns(3)
-                sets = a.number_input("Sets", 1, 5, int(item["sets"]), key=f"plan_sets_{idx}")
-                reps = b.number_input("Reps per set", 1, 30, int(item["reps"]), key=f"plan_reps_{idx}")
-                rest = c.number_input("Rest (seconds)", 15, 300, int(item["rest"]), key=f"plan_rest_{idx}")
-                edited.append({"exercise": ex, "sets": sets, "reps": reps, "rest": rest})
+                sets = a.number_input(
+                    "Sets", 1, 5, int(item["sets"]), key=f"plan_sets_{idx}"
+                )
+                reps = b.number_input(
+                    "Reps per set", 1, 30, int(item["reps"]), key=f"plan_reps_{idx}"
+                )
+                rest = c.number_input(
+                    "Rest (seconds)", 15, 300, int(item["rest"]), key=f"plan_rest_{idx}"
+                )
+                edited.append({
+                    "exercise": ex, "sets": sets, "reps": reps, "rest": rest
+                })
 
         add_col, remove_col = st.columns(2)
         if add_col.button("Add exercise"):
-            draft.append({"exercise": "Squats", "sets": 2, "reps": 8, "rest": 60})
+            draft.append({
+                "exercise": "Squats", "sets": 2, "reps": 8, "rest": 60
+            })
             st.session_state["draft_plan_items"] = draft
             st.rerun()
+
         if remove_col.button("Remove last exercise", disabled=len(draft) <= 1):
             draft.pop()
             st.session_state["draft_plan_items"] = draft
             st.rerun()
 
-        if st.button("Save my workout plan", type="primary", use_container_width=True):
-            plan_id = save_plan(active["user_code"], title.strip() or "My workout plan",
-                                active["goal"], edited)
-            st.success(f"Workout plan saved (Plan #{plan_id}).")
-            st.session_state.pop("draft_plan_items", None)
+        if st.button(
+            "Save my workout plan", type="primary", use_container_width=True
+        ):
+            plan_id = save_plan(
+                active["user_code"],
+                title.strip() or "My workout plan",
+                active["goal"],
+                edited
+            )
+            st.success(f"Workout plan saved successfully (Plan #{plan_id}).")
+
+            for key in (
+                "draft_plan_items", "draft_plan_title", "plan_title_input",
+                "ai_plan_rationale", "ai_plan_frequency",
+                "ai_plan_safety", "ai_plan_preferences_data"
+            ):
+                st.session_state.pop(key, None)
             st.rerun()
 
         if current_plan:
             st.divider()
-            st.markdown(f"**Saved plan:** {current_plan['title']}")
+            st.markdown(f"**Previously saved plan:** {current_plan['title']}")
             st.caption(f"Created {current_plan['created_at']}")
-            st.dataframe(pd.DataFrame(current_items), use_container_width=True, hide_index=True)
+            st.dataframe(
+                pd.DataFrame(current_items),
+                use_container_width=True,
+                hide_index=True
+            )
 
 elif page == "Exercises":
     st.subheader("Choose your exercise")
